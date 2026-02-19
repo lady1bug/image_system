@@ -1,136 +1,125 @@
 import os
-import json
-import time
-import random
-import cv2
+import timeit
 import numpy as np
 import pandas as pd
+import pickle as pkl
+import json
 from tqdm import tqdm
-from itertools import combinations
-from deepface import DeepFace
+from typing import List, Dict, Any
 from sklearn.metrics import accuracy_score
 
 from core.metrics import compute_eer, compute_min_dcf, compute_far_frr
 from core.cosine_similarity import cosine_similarity
+from face_exp_2_avg_embeds import get_embedding, load_grouped_dataset 
 
-
+# --- Налаштування ---
 DATASET_FOLDER = "dataset_img"
+RESULTS_CSV = "face_scores_exp_2.csv"
+JSON_DIR = "avg_embedings"
 MODELS = ["Facenet", "ArcFace", "VGG-Face", "SFace", "OpenFace"]
-RESULTS_CSV = "scores_faces.csv"
-JSON_DIR = "json_embeddings"
-os.makedirs(JSON_DIR, exist_ok=True)
 
+def evaluate_pipeline(model_name: str, data: List[List[str]]) -> Dict[str, Any]:
+    scores, labels = [], []
+    distance_self, distance_other = [], []
+    elapsed_time = []
 
-
-def split_images(folder, ratio=0.6):
-    imgs = [os.path.join(folder, f) for f in os.listdir(folder)
-            if f.lower().endswith((".jpg", ".png", ".jpeg"))]
-    random.shuffle(imgs)
-    k = int(len(imgs) * ratio)
-    return imgs[:k], imgs[k:]
-
-
-def preprocess_image(path):
-    img = cv2.imread(path)
-    if img is None:
-        return None
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.GaussianBlur(img, (3, 3), 0)
-    return img
-
-
-def get_embedding(path, model, use_preprocess=True):
+    # 1. Завантаження усереднених профілів
     try:
-        img = preprocess_image(path) if use_preprocess else path
-        rep = DeepFace.represent(
-            img_path=img,
-            model_name=model,
-            detector_backend="mtcnn",
-            enforce_detection=True,
-            align=True
-        )
-        return np.array(rep[0]["embedding"])
+        with open(f'./{JSON_DIR}/{model_name}.json', 'r') as f:
+            profiles_json = json.load(f)
+        profiles_np = {k: np.array(v) for k, v in profiles_json.items()}
     except Exception as e:
-        print(f"[{model}] Error on {path}: {e}")
-        return None
+        print(f"Error loading profiles for {model_name}: {e}")
+        return {}
+    
+    if not profiles_np:
+        return {}
 
+    # 2. Завантаження порогу (Threshold) з першого експерименту
+    try:
+        df_exp1 = pd.read_csv("face_scores_exp_1.csv")
+        thresh = float(df_exp1[df_exp1['pipeline'] == model_name]["threshold"].iloc[0])
+    except Exception:
+        print(f"Warning: Using default threshold 0.0 for {model_name}")
+        thresh = 0.0
+        
+    # 3. Тестування (1:N порівняння)
+    for group in tqdm(data, desc=f"Evaluating {model_name}"):
+        person_id = group[0].split(os.sep)[-2] 
 
-def build_profiles(dataset, model, ratio=0.6):
-    embeddings, test_data = {}, {}
-
-    for person in os.listdir(dataset):
-        path = os.path.join(dataset, person)
-        if not os.path.isdir(path):
-            continue
-
-        enroll_imgs, test_imgs = split_images(path, ratio)
-        test_data[person] = test_imgs
-
-        embs = [get_embedding(img, model) for img in enroll_imgs]
-        embs = [e for e in embs if e is not None]
-
-        if embs:
-            embeddings[person] = np.mean(embs, axis=0)
-
-
-    save_path = os.path.join(JSON_DIR, f"{model}_avg_embeddings.json")
-    with open(save_path, "w") as f:
-        json.dump({k: v.tolist() for k, v in embeddings.items()}, f)
-    print(f"[{model}] Profiles created: {len(embeddings)}")
-    return embeddings, test_data
-
-
-def evaluate(embeddings, test_data, model):
-    scores, labels, dist_same, dist_diff, times = [], [], [], [], []
-
-    for person, imgs in tqdm(test_data.items(), desc=f"Testing {model}"):
-        for img in imgs:
-            emb = get_embedding(img, model)
-            if emb is None:
+        for file in group:
+            test_emb = get_embedding(file, model_name)
+            if test_emb is None:
                 continue
-
-            start = time.time()
-            for profile, avg_emb in embeddings.items():
-                score = cosine_similarity(emb, avg_emb)
-                label = int(person == profile)
-                scores.append(score)
+            
+            for profile_id, avg_emb in profiles_np.items():
+                start_time = timeit.default_timer()
+                
+                similarity = cosine_similarity(test_emb, avg_emb)
+                distance = 1 - similarity
+                
+                elapsed_time.append(timeit.default_timer() - start_time)
+                
+                label = int(profile_id == person_id) 
+                scores.append(similarity)
                 labels.append(label)
-                (dist_same if label else dist_diff).append(1 - score)
-            times.append(time.time() - start)
+                
+                if label == 1:
+                    distance_self.append(distance)
+                else:
+                    distance_other.append(distance)
 
-    eer, thr, fa, fr = compute_eer(scores, labels)
-    fa_s, fr_s = compute_far_frr(scores, labels, thr)
-    acc = accuracy_score(labels, [s >= thr for s in scores])
-    dcf = compute_min_dcf(fr_s, fa_s)
+    if not scores:
+        return {}
+        
+    # 4. Обчислення біометричних показників
+    fa_score, fr_score = compute_far_frr(scores, labels, thresh)
+    min_dcf = compute_min_dcf(fr_score, fa_score)
+    ee_rate = (fr_score + fa_score) / 2 
+    
+    predictions = [1 if s >= thresh else 0 for s in scores]
 
     return {
-        "model": model,
-        "EER": eer,
-        "Threshold": thr,
-        "FAR": fa_s,
-        "FRR": fr_s,
-        "DCF": dcf,
-        "Accuracy": acc,
-        "Dist_same_mean": np.mean(dist_same) if dist_same else 0.0,
-        "Dist_same_std": np.std(dist_same) if dist_same else 0.0,
-        "Dist_diff_mean": np.mean(dist_diff) if dist_diff else 0.0,
-        "Dist_diff_std": np.std(dist_diff) if dist_diff else 0.0,
-        "Time_mean": np.mean(times) if times else 0.0,
-        "Time_std": np.std(times) if times else 0.0,
+        "pipeline": model_name,
+        "fa_score": fa_score,
+        "fr_score": fr_score,
+        "ee_rate": ee_rate,
+        "dcf": min_dcf, 
+        "threshold": thresh,
+        "accuracy": accuracy_score(labels, predictions),
+        "distance_self_mean": np.mean(distance_self),
+        "distance_self_std": np.std(distance_self),
+        "distance_other_mean": np.mean(distance_other) if distance_other else 0.0,
+        "distance_other_std": np.std(distance_other) if distance_other else 0.0,
+        "elapsed_time_mean": np.mean(elapsed_time),
+        "elapsed_time_std": np.std(elapsed_time),
     }
 
-
+def main():
+    # 1. Завантаження датасету
+    if os.path.exists("dataset_exp_2.pkl"):
+        with open("dataset_exp_2.pkl", "rb") as f:
+            dataset = pkl.load(f)
+    else:
+        dataset = load_grouped_dataset(DATASET_FOLDER) 
+        with open("dataset_exp_2.pkl", "wb") as f:
+            pkl.dump(dataset, f)
+    
+    print(f"Groups processed: {len(dataset)}")
+    
+    # 2. Експеримент для кожної моделі
+    results = {}
+    for model_name in MODELS:
+        print(f"\nProcessing model: {model_name}")
+        results[model_name] = evaluate_pipeline(model_name, dataset)
+    
+    # 3. Збереження фінального звіту
+    pd.DataFrame(results).transpose().to_csv(RESULTS_CSV) 
+    print(f"\nResults exported to {RESULTS_CSV}")
 
 if __name__ == "__main__":
-    enroll_ratio = 0.6
-    print(f"Face Verification: {enroll_ratio*100:.0f}% enrollment / {(1-enroll_ratio)*100:.0f}% test")
+    if os.path.exists(DATASET_FOLDER):
+        main()
+    else:
+        print(f"Dataset folder '{DATASET_FOLDER}' not found.")
 
-    results = []
-    for model in MODELS:
-        embeddings, test_data = build_profiles(DATASET_FOLDER, model, enroll_ratio)
-        metrics = evaluate(embeddings, test_data, model)
-        results.append(metrics)
-        #print(f"[{model}] ✅ EER={metrics['EER']:.4f}, Thr={metrics['Threshold']:.4f}, Acc={metrics['Accuracy']:.4f}")
-
-    pd.DataFrame(results).to_csv(RESULTS_CSV, index=False)
-    print(f"\nAll metrics saved → {RESULTS_CSV}")
